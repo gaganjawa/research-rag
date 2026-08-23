@@ -4,6 +4,8 @@
 !.env.example
 .venv/
 
+.idea/
+
 # Data: PDFs, OCR caches, indexes, run reports. All reproducible from corpus.yaml.
 data/
 
