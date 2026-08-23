@@ -2,6 +2,8 @@
 .env
 .venv/
 
+.idea/
+
 # Data: PDFs, caption cache, FAISS index. Rebuildable from papers.yaml.
 data/
 
