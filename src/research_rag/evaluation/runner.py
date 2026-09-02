@@ -24,7 +24,7 @@ import yaml
 
 from research_rag import guardrails as guards
 from research_rag.evaluation import judge as evals
-from research_rag.pipeline import ask
+from research_rag.pipeline import PipelineTrace, ask
 from research_rag.retrieval import store
 from research_rag.settings import get_settings
 
@@ -51,15 +51,12 @@ def load_golden(path: Path) -> dict[str, str]:
     return cases
 
 
-# Kept as a module value so a lesson or unit test can replace the tiny dataset.
-# A wheel installed outside a checkout has no implicit corpus configuration;
-# deferring the missing-file error keeps `research-rag eval --help` usable.
+# Keeping the small dataset replaceable makes lessons and tests straightforward.
 _DEFAULT_GOLDEN_PATH = get_settings().golden_questions_path
 GOLDEN = load_golden(_DEFAULT_GOLDEN_PATH) if _DEFAULT_GOLDEN_PATH.is_file() else {}
 
 
-def main(argv: list[str] | None = None) -> None:
-    settings = get_settings()
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="research-rag eval", description=__doc__)
     parser.add_argument(
         "--limit", type=int, help="evaluate only the first N golden questions"
@@ -71,25 +68,27 @@ def main(argv: list[str] | None = None) -> None:
         "--json", type=Path, help="also write a machine-readable report"
     )
     parser.add_argument(
-        "--golden",
-        type=Path,
-        help="override RAG_GOLDEN_PATH for this run",
+        "--golden", type=Path, help="override RAG_GOLDEN_PATH for this run"
     )
     parser.add_argument(
         "--query-mode",
         choices=("original", "rewrite", "hyde", "hybrid", "auto"),
-        default=None,
         help="override RAG_QUERY_MODE for this run",
     )
     parser.add_argument(
         "--no-rerank", action="store_true", help="disable reranking for this run"
     )
-    args = parser.parse_args(argv)
+    return parser.parse_args(argv)
 
-    if args.golden:
-        golden = load_golden(args.golden.expanduser().resolve())
-    else:
-        golden = GOLDEN or load_golden(settings.golden_questions_path)
+
+def main(argv: list[str] | None = None) -> None:
+    settings = get_settings()
+    args = _parse_args(argv)
+    golden = (
+        load_golden(args.golden.expanduser().resolve())
+        if args.golden
+        else GOLDEN or load_golden(settings.golden_questions_path)
+    )
     cases = list(golden.items())
     if args.limit is not None:
         cases = cases[: max(args.limit, 0)]
@@ -119,22 +118,22 @@ def main(argv: list[str] | None = None) -> None:
             answer.trace.sanitized_question if answer.trace else safe_question
         )
         contexts = answer.trace.contexts if answer.trace else []
-        context_chunks = [chunk for chunk, _ in contexts]
-        paper_hit = any(chunk.paper == expected_paper for chunk in context_chunks)
+        chunks = [chunk for chunk, _ in contexts]
+        paper_hit = any(chunk.paper == expected_paper for chunk in chunks)
         cited_hit = any(
             citation.get("chunk_id", "").split(":", 1)[0] == expected_paper
             for citation in answer.citations
         )
-
-        judged = None
-        if not args.skip_judge:
-            judged = evals.evaluate(
+        judged = (
+            None
+            if args.skip_judge
+            else evals.evaluate(
                 evaluated_question,
                 answer.answer,
-                context_chunks,
+                chunks,
                 refused=answer.refused,
             )
-
+        )
         records.append(
             {
                 "question": evaluated_question,
@@ -145,38 +144,11 @@ def main(argv: list[str] | None = None) -> None:
                 "unavailable": answer.unavailable,
                 "answer": answer.answer,
                 "citations": answer.citations,
-                "context_ids": [chunk.id for chunk in context_chunks],
-                "pipeline": {
-                    "query_mode": answer.trace.query_mode if answer.trace else None,
-                    "query_kinds": list(answer.trace.query_kinds)
-                    if answer.trace
-                    else [],
-                    "query_model": answer.trace.query_model if answer.trace else None,
-                    "rerank_applied": answer.trace.rerank_applied
-                    if answer.trace
-                    else False,
-                    "rerank_provider": answer.trace.rerank_provider
-                    if answer.trace
-                    else None,
-                    "rerank_model": answer.trace.rerank_model if answer.trace else None,
-                    "rerank_error": answer.trace.rerank_error if answer.trace else None,
-                    "expansion_status": answer.trace.expansion_status
-                    if answer.trace
-                    else {},
-                    "expansion_errors": list(answer.trace.expansion_errors)
-                    if answer.trace
-                    else [],
-                    "retrieval_error": answer.trace.retrieval_error
-                    if answer.trace
-                    else None,
-                    "generation_error": answer.trace.generation_error
-                    if answer.trace
-                    else None,
-                },
+                "context_ids": [chunk.id for chunk in chunks],
+                "pipeline": _pipeline_record(answer.trace),
                 "evaluation": asdict(judged) if judged else None,
             }
         )
-
         print(
             f"{evaluated_question[:49]:50s} "
             f"{_yes(paper_hit):6s} {_yes(cited_hit):6s} "
@@ -202,12 +174,10 @@ def main(argv: list[str] | None = None) -> None:
                 if record["evaluation"]
                 and record["evaluation"][name]["score"] is not None
             ]
-            value = sum(scores) / len(scores) if scores else None
-            print(f"mean {name.replace('_', ' ')}: {_number(value)}")
+            mean = sum(scores) / len(scores) if scores else None
+            print(f"mean {name.replace('_', ' ')}: {_number(mean)}")
 
     if args.json:
-        args.json.parent.mkdir(parents=True, exist_ok=True)
-        successful = [record for record in records if "error" not in record]
         report = {
             "schema_version": REPORT_SCHEMA_VERSION,
             "created_at": datetime.now(UTC).isoformat(),
@@ -221,9 +191,9 @@ def main(argv: list[str] | None = None) -> None:
             },
             "index": store.readiness(settings),
             "summary": {
-                "case_count": len(records),
-                "completed_count": len(successful),
-                "pipeline_error_count": len(records) - len(successful),
+                "case_count": total,
+                "completed_count": len(completed),
+                "pipeline_error_count": failures,
                 "paper_hit_rate": paper_hits / total if total else None,
                 "verified_citation_rate": cited_hits / total if total else None,
             },
@@ -231,6 +201,36 @@ def main(argv: list[str] | None = None) -> None:
         }
         _atomic_json(args.json, report)
         print(f"report: {args.json}")
+
+
+def _pipeline_record(trace: PipelineTrace | None) -> dict[str, Any]:
+    if trace is None:
+        return {
+            "query_mode": None,
+            "query_kinds": [],
+            "query_model": None,
+            "rerank_applied": False,
+            "rerank_provider": None,
+            "rerank_model": None,
+            "rerank_error": None,
+            "expansion_status": {},
+            "expansion_errors": [],
+            "retrieval_error": None,
+            "generation_error": None,
+        }
+    return {
+        "query_mode": trace.query_mode,
+        "query_kinds": list(trace.query_kinds),
+        "query_model": trace.query_model,
+        "rerank_applied": trace.rerank_applied,
+        "rerank_provider": trace.rerank_provider,
+        "rerank_model": trace.rerank_model,
+        "rerank_error": trace.rerank_error,
+        "expansion_status": trace.expansion_status,
+        "expansion_errors": list(trace.expansion_errors),
+        "retrieval_error": trace.retrieval_error,
+        "generation_error": trace.generation_error,
+    }
 
 
 def _atomic_json(path: Path, value: dict) -> None:
@@ -255,9 +255,7 @@ def _yes(value: bool) -> str:
 
 
 def _metric(evaluation: evals.Evaluation | None, name: str) -> str:
-    if evaluation is None:
-        return "-"
-    return _number(getattr(evaluation, name).score)
+    return "-" if evaluation is None else _number(getattr(evaluation, name).score)
 
 
 def _number(value: float | None) -> str:

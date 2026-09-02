@@ -3,6 +3,7 @@
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from research_rag.errors import ConfigurationError
 from research_rag.settings import Settings
@@ -99,9 +100,11 @@ def test_missing_api_key_fails_only_when_a_provider_needs_it(monkeypatch):
     [
         ("RAG_QUERY_MODE", "magic"),
         ("RAG_VECTOR_BACKEND", "magic"),
+        ("RAG_RERANK", "auto"),
         ("RAG_RERANK", "sometimes"),
         ("RAG_CONTEXT_K", "0"),
         ("QDRANT_TIMEOUT_SECONDS", "0"),
+        ("QDRANT_PREFER_GRPC", "auto"),
         ("QDRANT_PREFER_GRPC", "sometimes"),
         ("RAG_API_PORT", "70000"),
         ("OPENAI_TIMEOUT_SECONDS", "-1"),
@@ -112,3 +115,45 @@ def test_invalid_environment_values_fail_fast(monkeypatch, name: str, value: str
 
     with pytest.raises(ConfigurationError):
         Settings.from_env()
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        *[
+            (name, 0)
+            for name in (
+                "qdrant_timeout_seconds",
+                "qdrant_index_timeout_seconds",
+                "qdrant_replication_factor",
+                "qdrant_write_consistency_factor",
+                "per_query_k",
+                "candidate_k",
+                "context_k",
+                "openai_timeout_seconds",
+                "download_timeout_seconds",
+                "api_port",
+            )
+        ],
+        *[(name, -1) for name in ("openai_max_retries", "download_retries")],
+        *[
+            (name, "")
+            for name in (
+                "embedding_model",
+                "caption_model",
+                "query_model",
+                "rerank_model",
+                "generation_model",
+                "evaluation_model",
+                "api_host",
+                "log_level",
+            )
+        ],
+        ("api_port", 65_536),
+    ],
+)
+def test_programmatic_settings_enforce_the_same_field_bounds(
+    settings_factory, name: str, value: object
+):
+    with pytest.raises(ValidationError):
+        settings_factory(**{name: value})

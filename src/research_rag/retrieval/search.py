@@ -1,13 +1,7 @@
-"""Advanced retrieval: search several query views, then fuse their rankings.
+"""Search query views and combine their rankings with weighted RRF.
 
-The vector index still does the broad, cheap search.  Query rewriting and HyDE
-only change what we search with; Reciprocal Rank Fusion (RRF) combines the
-ranked lists without pretending that cosine scores from different queries are
-directly comparable.
-
-The original question is always one of the query views.  Rewrites and a HyDE
-document can improve recall, but neither is trusted as evidence: only real
-indexed chunks are returned to generation.
+Rewrites and HyDE can improve recall, but only indexed chunks are returned.
+HyDE similarity is tracked separately so synthetic text cannot prove relevance.
 """
 
 from dataclasses import dataclass
@@ -22,12 +16,16 @@ QUERY_WEIGHTS = {"original": 1.0, "rewrite": 0.8, "hyde": 0.7}
 
 @dataclass(frozen=True)
 class Candidate:
-    """One real chunk found through one or more query variants."""
+    """One real chunk found through one or more query variants.
+
+    Best similarity may include HyDE; real-query score excludes it. RRF score
+    orders candidates without comparing cosine scores across query views.
+    """
 
     chunk: Chunk
-    vector_score: float
-    guard_score: float
-    fusion_score: float
+    best_similarity: float
+    real_query_score: float
+    rrf_score: float
     query_kinds: tuple[str, ...]
 
 
@@ -39,19 +37,10 @@ def retrieve(
     candidate_k: int = 20,
     diagnostics: dict[str, str] | None = None,
 ) -> list[Candidate]:
-    """Retrieve for each query variant and fuse the unique chunk rankings.
-
-    ``vector_score`` is the best cosine score seen for a chunk and is kept for
-    the evidence floor. ``fusion_score`` is used only for ordering candidates.
-    """
-    if per_query_k < 1 or candidate_k < 1:
+    """Search every query view, retry the original on failure, then fuse."""
+    if per_query_k < 1 or candidate_k < 1 or not variants:
         return []
 
-    if not variants:
-        return []
-
-    # Every backend receives the same batch. This is one OpenAI embedding call
-    # and, for Qdrant, one server request whether the plan has one or four views.
     try:
         ranked_lists = vector_store.search_many(
             [variant.text for variant in variants], k=per_query_k
@@ -75,46 +64,42 @@ def retrieve(
                 "original-query retry returned an invalid ranking"
             ) from exc
 
-    # chunk id -> mutable aggregate kept local so Candidate can stay frozen.
     combined: dict[str, dict] = {}
     for variant, ranked in zip(variants, ranked_lists, strict=True):
         weight = QUERY_WEIGHTS.get(variant.kind, 0.7)
-        for rank, (chunk, vector_score) in enumerate(ranked, start=1):
+        for rank, (chunk, similarity) in enumerate(ranked, start=1):
             item = combined.setdefault(
                 chunk.id,
                 {
                     "chunk": chunk,
-                    "vector_score": vector_score,
-                    "guard_score": float("-inf"),
-                    "fusion_score": 0.0,
+                    "best_similarity": similarity,
+                    "real_query_score": float("-inf"),
+                    "rrf_score": 0.0,
                     "query_kinds": set(),
                 },
             )
-            item["vector_score"] = max(item["vector_score"], vector_score)
-            # A fabricated HyDE document can drift toward a plausible but
-            # unrelated neighborhood. It helps ranking, but cannot by itself
-            # satisfy the evidence-quality guard.
+            item["best_similarity"] = max(item["best_similarity"], similarity)
             if variant.kind != "hyde":
-                item["guard_score"] = max(item["guard_score"], vector_score)
-            item["fusion_score"] += weight / (RRF_K + rank)
+                item["real_query_score"] = max(item["real_query_score"], similarity)
+            item["rrf_score"] += weight / (RRF_K + rank)
             item["query_kinds"].add(variant.kind)
 
     candidates = [
         Candidate(
             chunk=item["chunk"],
-            vector_score=float(item["vector_score"]),
-            guard_score=float(item["guard_score"]),
-            fusion_score=float(item["fusion_score"]),
+            best_similarity=float(item["best_similarity"]),
+            real_query_score=float(item["real_query_score"]),
+            rrf_score=float(item["rrf_score"]),
             query_kinds=tuple(sorted(item["query_kinds"])),
         )
         for item in combined.values()
     ]
     candidates.sort(
-        key=lambda item: (item.fusion_score, item.vector_score), reverse=True
+        key=lambda item: (item.rrf_score, item.best_similarity), reverse=True
     )
     return candidates[:candidate_k]
 
 
 def as_scored_chunks(candidates: list[Candidate]) -> list[tuple[Chunk, float]]:
     """Adapter for reranking/generation while retaining trace data separately."""
-    return [(candidate.chunk, candidate.vector_score) for candidate in candidates]
+    return [(candidate.chunk, candidate.best_similarity) for candidate in candidates]

@@ -1,8 +1,8 @@
-"""Small, transparent LLM-as-judge evaluations for the final RAG answer.
+"""Transparent LLM-as-judge metrics for one completed RAG answer.
 
-The judge makes one structured call.  Python, rather than the judge, computes
-the aggregate context-relevance and faithfulness scores so the denominators and
-failure semantics remain explicit and testable.
+Context relevance compares question with context, answer relevance compares
+question with answer, and faithfulness compares answer claims with context. The
+judge makes one structured call; Python computes the aggregate scores.
 """
 
 from __future__ import annotations
@@ -107,45 +107,34 @@ def evaluate(
     client=None,
     refused: bool | None = None,
 ) -> Evaluation:
-    """Judge an answer once and derive stable aggregate scores in Python.
+    """Make at most one judge call, then compute all metric aggregates locally."""
 
-    Empty answers are handled locally. ``refused`` is authoritative when the
-    pipeline supplies it; prefix recognition remains a standalone fallback.
-    Refusals still send their final contexts to the judge, because context
-    usefulness is independent of whether generation produced an answer; answer
-    relevance and faithfulness are then set deterministically.
-    """
     unique_contexts = _unique_contexts(contexts)
     if not isinstance(answer, str) or not answer.strip():
-        reason = "No answer was produced; answer relevance is zero and faithfulness is not applicable."
-        context_scores = [
+        scores = [
             ContextScore(chunk.id, 0.0, "Not judged because no answer was produced.")
             for chunk in unique_contexts
         ]
-        context_metric = _context_metric(
-            context_scores,
-            no_context_reason="No final contexts were available to score.",
-        )
         return Evaluation(
-            context_relevance=context_metric,
-            answer_relevance=Metric(0.0, reason),
-            faithfulness=Metric(
-                None, "Faithfulness is not applicable to an empty or refused answer."
+            _context_metric(scores),
+            Metric(
+                0.0,
+                "No answer was produced; answer relevance is zero and faithfulness is not applicable.",
             ),
-            contexts=context_scores,
+            Metric(
+                None,
+                "Faithfulness is not applicable to an empty or refused answer.",
+            ),
+            scores,
         )
 
     is_refused = _is_refusal(answer) if refused is None else refused
     if is_refused and not unique_contexts:
         return Evaluation(
-            context_relevance=Metric(
-                None, "No final contexts were available to score."
-            ),
-            answer_relevance=Metric(0.0, "The pipeline produced a refusal."),
-            faithfulness=Metric(
-                None, "Faithfulness is not applicable to a refused answer."
-            ),
-            contexts=[],
+            Metric(None, "No final contexts were available to score."),
+            Metric(0.0, "The pipeline produced a refusal."),
+            Metric(None, "Faithfulness is not applicable to a refused answer."),
+            [],
         )
 
     try:
@@ -162,15 +151,14 @@ def evaluate(
             ],
             response_format={"type": "json_schema", "json_schema": SCHEMA},
         )
-    except Exception:  # noqa: BLE001 - provider and injected clients have different exception types
+    except Exception:  # noqa: BLE001 - provider clients raise different exceptions
         return _failed(
             "Evaluation unavailable because the judge request failed.",
             refused=is_refused,
         )
 
     try:
-        content = completion.choices[0].message.content
-        raw = json.loads(content)
+        raw = json.loads(completion.choices[0].message.content)
         if not isinstance(raw, dict):
             raise TypeError("judge response is not an object")
     except (AttributeError, IndexError, TypeError, ValueError, json.JSONDecodeError):
@@ -180,28 +168,25 @@ def evaluate(
         )
 
     context_scores = _parse_context_scores(raw.get("context_scores"), unique_contexts)
-    context_metric = _context_metric(
-        context_scores, no_context_reason="No final contexts were available to score."
-    )
+    context_metric = _context_metric(context_scores)
     if is_refused:
         answer_metric = Metric(0.0, "The pipeline produced a refusal.")
-        supported, total = 0, 0
-        unsupported: list[str] = []
         faithfulness = Metric(
             None, "Faithfulness is not applicable to a refused answer."
         )
+        supported, total = 0, 0
+        unsupported: list[str] = []
     else:
         answer_metric = _parse_answer_relevance(raw.get("answer_relevance"))
         supported, total, unsupported = _parse_claims(raw.get("claims"))
-        if total:
-            faithfulness = Metric(
+        faithfulness = (
+            Metric(
                 supported / total,
                 f"{supported} of {total} atomic claims are supported by the final contexts.",
             )
-        else:
-            faithfulness = Metric(
-                None, "The judge returned no valid atomic claims to score."
-            )
+            if total
+            else Metric(None, "The judge returned no valid atomic claims to score.")
+        )
 
     return Evaluation(
         context_relevance=context_metric,
@@ -233,13 +218,10 @@ def _judge_input(question: str, answer: str, contexts: list[Chunk]) -> str:
 
 
 def _unique_contexts(contexts: list[Chunk]) -> list[Chunk]:
-    unique = []
-    seen = set()
+    unique: dict[str, Chunk] = {}
     for chunk in contexts:
-        if chunk.id not in seen:
-            unique.append(chunk)
-            seen.add(chunk.id)
-    return unique
+        unique.setdefault(chunk.id, chunk)
+    return list(unique.values())
 
 
 def _parse_context_scores(
@@ -265,8 +247,7 @@ def _parse_context_scores(
                 reason = "The judge supplied no reason."
             parsed[chunk_id] = ContextScore(chunk_id, score, reason.strip())
 
-    # Missing or malformed entries count as zero rather than disappearing from
-    # the denominator and artificially inflating context relevance.
+    # Invalid or missing entries stay in the denominator with a zero score.
     return [
         parsed.get(
             chunk.id,
@@ -280,9 +261,9 @@ def _parse_context_scores(
     ]
 
 
-def _context_metric(scores: list[ContextScore], *, no_context_reason: str) -> Metric:
+def _context_metric(scores: list[ContextScore]) -> Metric:
     if not scores:
-        return Metric(None, no_context_reason)
+        return Metric(None, "No final contexts were available to score.")
     mean = sum(item.score for item in scores) / len(scores)
     return Metric(mean, f"Mean usefulness across {len(scores)} final contexts.")
 
@@ -331,10 +312,10 @@ def _parse_claims(raw_claims: object) -> tuple[int, int, list[str]]:
 def _score(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    value = float(value)
-    if not math.isfinite(value):
+    score = float(value)
+    if not math.isfinite(score):
         return None
-    return min(1.0, max(0.0, value))
+    return min(1.0, max(0.0, score))
 
 
 def _is_refusal(answer: str) -> bool:
@@ -367,17 +348,12 @@ def _is_refusal(answer: str) -> bool:
 
 def _failed(reason: str, *, refused: bool = False) -> Evaluation:
     unavailable = Metric(None, reason)
-    return Evaluation(
-        context_relevance=unavailable,
-        answer_relevance=(
-            Metric(0.0, "The pipeline produced a refusal.")
-            if refused
-            else Metric(None, reason)
-        ),
-        faithfulness=(
-            Metric(None, "Faithfulness is not applicable to a refused answer.")
-            if refused
-            else Metric(None, reason)
-        ),
-        contexts=[],
+    answer_metric = (
+        Metric(0.0, "The pipeline produced a refusal.") if refused else unavailable
     )
+    faithfulness = (
+        Metric(None, "Faithfulness is not applicable to a refused answer.")
+        if refused
+        else unavailable
+    )
+    return Evaluation(unavailable, answer_metric, faithfulness, [])

@@ -1,10 +1,7 @@
-"""Turn one question into a small set of better retrieval queries.
+"""Add search-friendly rewrites, decomposition, and retrieval-only HyDE.
 
-The original question is always searched. One OpenAI call can add:
-
-- rewrites: the same need expressed with search-friendly wording,
-- decomposition: smaller searches for a multi-part question,
-- HyDE: an answer-shaped passage used only for retrieval, never as evidence.
+The original question is always searched, and one OpenAI call creates every
+requested variant.
 """
 
 import json
@@ -16,7 +13,7 @@ from typing import Annotated
 from pydantic import BaseModel, ConfigDict, Field
 
 from research_rag.clients import openai_client
-from research_rag.settings import DEFAULT_QUERY_MODEL, get_settings
+from research_rag.settings import DEFAULT_QUERY_MODEL, Settings, get_settings
 
 DEFAULT_MODEL = DEFAULT_QUERY_MODEL
 MODES = frozenset({"original", "rewrite", "hyde", "hybrid", "auto"})
@@ -27,16 +24,12 @@ ShortVariant = Annotated[str, Field(max_length=MAX_VARIANT_CHARS)]
 
 @dataclass(frozen=True)
 class QueryVariant:
-    """One text to embed for retrieval and how it was produced."""
-
     text: str
     kind: str
 
 
 @dataclass(frozen=True)
 class ExpansionResult:
-    """Query variants plus safe diagnostics for traces and eval reports."""
-
     variants: list[QueryVariant]
     strategy_status: dict[str, str]
     errors: tuple[str, ...] = ()
@@ -44,8 +37,6 @@ class ExpansionResult:
 
 
 class ExpansionOutput(BaseModel):
-    """The structured response expected from OpenAI."""
-
     model_config = ConfigDict(extra="forbid")
 
     rewrites: list[ShortVariant] = Field(max_length=MAX_REWRITES)
@@ -81,17 +72,18 @@ _MULTI_PART = re.compile(
 
 def should_expand(question: str) -> bool:
     """Identify questions likely to benefit from both expansion strategies."""
-
     text = question.strip()
     if not text:
         return False
-    if _OPEN_ENDED.search(text) or _MULTI_PART.search(text):
-        return True
-    if text.count("?") > 1 or "\n" in text or ";" in text:
-        return True
-    if len(_QUESTION_WORD.findall(text)) >= 2:
-        return True
-    return len(re.findall(r"\b\w+\b", text)) >= 18
+    return bool(
+        _OPEN_ENDED.search(text)
+        or _MULTI_PART.search(text)
+        or text.count("?") > 1
+        or "\n" in text
+        or ";" in text
+        or len(_QUESTION_WORD.findall(text)) >= 2
+        or len(re.findall(r"\b\w+\b", text)) >= 18
+    )
 
 
 def expand(
@@ -100,6 +92,7 @@ def expand(
     *,
     client=None,
     max_rewrites: int = MAX_REWRITES,
+    settings: Settings | None = None,
 ) -> ExpansionResult:
     """Return the original query plus optional rewrites and a HyDE passage."""
 
@@ -111,27 +104,24 @@ def expand(
 
     variants = [QueryVariant(question, "original")]
     status = {"rewrite": "not-requested", "hyde": "not-requested"}
-    if not question.strip() or mode == "original":
-        return ExpansionResult(variants, status)
-
     selected = "hybrid" if mode == "auto" and should_expand(question) else mode
-    if selected == "auto":
+    if not question.strip() or selected in {"original", "auto"}:
         return ExpansionResult(variants, status)
 
     rewrite_limit = min(MAX_REWRITES, max(0, max_rewrites))
     wants_rewrites = selected in {"rewrite", "hybrid"} and rewrite_limit > 0
     wants_hyde = selected in {"hyde", "hybrid"}
-    if wants_rewrites:
-        status["rewrite"] = "pending"
-    if wants_hyde:
-        status["hyde"] = "pending"
+    status = {
+        "rewrite": "pending" if wants_rewrites else "not-requested",
+        "hyde": "pending" if wants_hyde else "not-requested",
+    }
     if not wants_rewrites and not wants_hyde:
         return ExpansionResult(variants, status)
 
-    settings = get_settings()
-    model = settings.query_model
+    active_settings = settings if settings is not None else get_settings()
+    model = active_settings.query_model
     try:
-        active_client = client if client is not None else openai_client(settings)
+        active_client = client if client is not None else openai_client(active_settings)
         plan = _plan(
             active_client,
             question,

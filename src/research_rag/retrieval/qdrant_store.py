@@ -1,8 +1,8 @@
-"""The server-backed Qdrant vector-store implementation.
+"""Build, publish, load, and query the Qdrant vector store.
 
-Each ingestion writes a new physical collection, validates it, and then moves a
-stable alias in one atomic operation. The previous collection is retained so an
-operator can roll back the alias without re-embedding the corpus.
+Ingestion prepares a versioned physical collection and atomically moves a
+stable alias only after validation. Serving resolves that alias once and pins
+the validated physical build for the process lifetime.
 """
 
 import hashlib
@@ -11,7 +11,7 @@ import math
 import time
 import uuid
 from contextlib import suppress
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from functools import lru_cache
 from typing import Literal
@@ -59,19 +59,15 @@ def build(
 
     if not chunks:
         raise ValueError("cannot build an empty index")
-    chunk_ids = [chunk.id for chunk in chunks]
-    if len(chunk_ids) != len(set(chunk_ids)):
+    if len({chunk.id for chunk in chunks}) != len(chunks):
         raise ValueError("chunk ids must be unique")
 
-    # Fail before an expensive corpus-wide embedding call when the configured
-    # service, credentials, or alias cannot be used.
+    # Check connectivity and alias safety before the expensive embedding call.
     active_client = client or qdrant_client(settings)
     _check_server_ready(active_client)
     initial_aliases = _aliases(active_client)
-    if (
-        settings.qdrant_collection not in initial_aliases
-        and active_client.collection_exists(settings.qdrant_collection)
-    ):
+    alias = settings.qdrant_collection
+    if alias not in initial_aliases and active_client.collection_exists(alias):
         raise IndexUnavailable(
             "Qdrant alias name collides with an existing physical collection"
         )
@@ -90,7 +86,7 @@ def build(
     ).encode("utf-8")
     chunks_sha256 = hashlib.sha256(chunks_bytes).hexdigest()
     build_id = uuid.uuid4().hex
-    physical_name = f"{settings.qdrant_collection}__{build_id}"
+    physical_name = f"{alias}__{build_id}"
     manifest = QdrantManifest(
         schema_version=SCHEMA_VERSION,
         backend="qdrant",
@@ -101,7 +97,7 @@ def build(
         corpus_sha256=corpus_sha256 or chunks_sha256,
         chunks_sha256=chunks_sha256,
         collection_name=physical_name,
-        alias_name=settings.qdrant_collection,
+        alias_name=alias,
         created_at=datetime.now(UTC).isoformat(),
     )
 
@@ -119,8 +115,6 @@ def build(
     if not created:
         raise IndexUnavailable("Qdrant did not create the new collection")
 
-    # Nothing below this point can affect the currently published alias until
-    # the final update_collection_aliases call.
     try:
         active_client.upload_points(
             collection_name=physical_name,
@@ -155,37 +149,34 @@ def build(
     except Exception:
         _delete_unpublished(active_client, physical_name, settings)
         raise
-    if publish_aliases.get(settings.qdrant_collection) != initial_aliases.get(
-        settings.qdrant_collection
-    ):
+    if publish_aliases.get(alias) != initial_aliases.get(alias):
         _delete_unpublished(active_client, physical_name, settings)
         raise IndexUnavailable("Qdrant alias changed during ingestion; retry the build")
 
     operations: list[models.AliasOperations] = []
-    if settings.qdrant_collection in publish_aliases:
+    if alias in publish_aliases:
         operations.append(
             models.DeleteAliasOperation(
-                delete_alias=models.DeleteAlias(alias_name=settings.qdrant_collection)
+                delete_alias=models.DeleteAlias(alias_name=alias)
             )
         )
     operations.append(
         models.CreateAliasOperation(
             create_alias=models.CreateAlias(
                 collection_name=physical_name,
-                alias_name=settings.qdrant_collection,
+                alias_name=alias,
             )
         )
     )
 
-    # Do not delete the new collection if this call times out: the server may
-    # have completed the atomic switch even when the client missed the reply.
+    # After this starts, a timeout cannot prove whether the atomic switch ran.
     published = active_client.update_collection_aliases(
         change_aliases_operations=operations,
         timeout=settings.qdrant_timeout_seconds,
     )
     if not published:
         raise IndexUnavailable("Qdrant did not publish the new collection alias")
-    if _aliases(active_client).get(settings.qdrant_collection) != physical_name:
+    if _aliases(active_client).get(alias) != physical_name:
         raise IndexUnavailable("Qdrant alias publication could not be verified")
 
     _load_cached.cache_clear()
@@ -211,6 +202,7 @@ def _load_cached(settings: Settings) -> "QdrantVectorStore":
     physical_name = aliases.get(settings.qdrant_collection)
     if physical_name is None:
         raise IndexUnavailable("no Qdrant index found; run: research-rag ingest")
+
     manifest = _validate_collection(
         active_client,
         settings.qdrant_collection,
@@ -227,21 +219,14 @@ def _load_cached(settings: Settings) -> "QdrantVectorStore":
     )
 
 
+@dataclass
 class QdrantVectorStore:
-    """A validated Qdrant alias implementing the shared search contract."""
+    """A validated physical collection implementing the shared search API."""
 
     backend = "qdrant"
-
-    def __init__(
-        self,
-        *,
-        client: QdrantClient,
-        settings: Settings,
-        manifest: QdrantManifest,
-    ) -> None:
-        self.client = client
-        self.settings = settings
-        self.manifest = manifest
+    client: QdrantClient
+    settings: Settings
+    manifest: QdrantManifest
 
     def search_many(
         self, questions: list[str], *, k: int
@@ -260,9 +245,8 @@ class QdrantVectorStore:
 
         try:
             responses = self.client.query_batch_points(
-                # Pin the validated physical build for this process. The alias
-                # selects a build at startup; rolling restarts move replicas to
-                # a newly published build without changing one under a request.
+                # Pin the validated physical build. A rolling restart can pick
+                # up a new alias target without changing one under a request.
                 collection_name=self.manifest.collection_name,
                 requests=[
                     models.QueryRequest(
@@ -287,7 +271,7 @@ class QdrantVectorStore:
             raise IndexUnavailable("Qdrant query failed") from exc
 
     def readiness(self) -> dict[str, object]:
-        """Check server/collection state without exposing connection details."""
+        """Check server and collection state without exposing connection data."""
 
         _check_server_ready(self.client)
         info = self.client.get_collection(self.manifest.collection_name)
@@ -403,11 +387,9 @@ def _wait_until_green(
 
 
 def _check_server_ready(client: QdrantClient) -> None:
-    try:
-        client.http.service_api.readyz()
-    except NotImplementedError:
-        # In-memory Qdrant is permitted only in offline tests and has no REST API.
-        return
+    """Use the public SDK surface for both remote and in-memory clients."""
+
+    client.info()
 
 
 def _aliases(client: QdrantClient) -> dict[str, str]:

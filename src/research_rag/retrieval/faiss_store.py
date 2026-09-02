@@ -133,7 +133,9 @@ def clear_cache() -> None:
 
 
 @lru_cache(maxsize=4)
-def _load_cached(index_dir_text: str, embedding_model: str):
+def _load_cached(
+    index_dir_text: str, embedding_model: str
+) -> tuple[faiss.Index, list[Chunk], str]:
     index_dir = Path(index_dir_text)
     current = index_dir / "CURRENT"
     try:
